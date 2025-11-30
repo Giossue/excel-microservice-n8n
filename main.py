@@ -23,20 +23,18 @@ class QuotationData(BaseModel):
     items: List[Product]
     Total: float
 
-# --- CONFIGURACIÓN DE DIMENSIONES ---
+# --- CONFIGURACIÓN ---
 sem = asyncio.Semaphore(5)
 
-# Dimensiones de la celda de producto (aprox)
+# Celdas y Límites
 CELL_WIDTH_PX = 210
 CELL_HEIGHT_PX = 160
 
-# Dimensiones MÁXIMAS para la imagen del producto (con margen)
-MAX_PROD_IMG_WIDTH = 180
-MAX_PROD_IMG_HEIGHT = 130 
-
-# Dimensiones MÁXIMAS para el LOGO (Para que quepa en la esquina sup. izq)
-MAX_LOGO_WIDTH = 180
-MAX_LOGO_HEIGHT = 90
+# Límites de Imágenes (Con margen de seguridad)
+MAX_PROD_W = 180
+MAX_PROD_H = 130
+MAX_LOGO_W = 180
+MAX_LOGO_H = 100 # Un poco más alto para que quepa el texto del logo
 
 async def process_image(session, url):
     if not url or not str(url).startswith("http"):
@@ -44,31 +42,48 @@ async def process_image(session, url):
     
     async with sem: 
         try:
-            # Headers para evitar bloqueos
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
             async with session.get(str(url), headers=headers, timeout=15) as response:
                 if response.status == 200:
                     data = await response.read()
-                    # Usamos la misma función de resize, pero con las dimensiones de producto
-                    return await asyncio.to_thread(resize_image_generic, data, MAX_PROD_IMG_WIDTH, MAX_PROD_IMG_HEIGHT)
+                    # Usamos la función de redimensionado inteligente
+                    return await asyncio.to_thread(smart_resize, data, MAX_PROD_W, MAX_PROD_H)
         except Exception as e:
             print(f"Error descargando {url}: {e}")
             return None, 0, 0
     return None, 0, 0
 
-def resize_image_generic(data, max_w, max_h):
+def smart_resize(data, target_w, target_h):
     try:
         with PILImage.open(io.BytesIO(data)) as img:
-            img = img.convert("RGB")
-            # Thumbnail mantiene la proporción y asegura que entre en la caja
-            img.thumbnail((max_w, max_h))
+            # 1. GESTIÓN DE TRANSPARENCIA (Vital para el logo)
+            if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+                img = img.convert("RGBA") # Mantener transparencia
+            else:
+                img = img.convert("RGB") # Imagen normal sin transparencia
+
+            # 2. CÁLCULO MATEMÁTICO DE ASPECT RATIO (Regla de tres)
+            # Calculamos cuánto tendríamos que reducir para encajar en ancho y alto
+            original_w, original_h = img.size
+            ratio_w = target_w / original_w
+            ratio_h = target_h / original_h
             
-            final_w, final_h = img.size
+            # Elegimos el ratio menor para asegurar que quepa entera sin recortar
+            scale = min(ratio_w, ratio_h)
+            
+            # Nuevas dimensiones
+            new_w = int(original_w * scale)
+            new_h = int(original_h * scale)
+
+            # 3. REDIMENSIONADO DE ALTA CALIDAD (Lanczos)
+            img = img.resize((new_w, new_h), PILImage.Resampling.LANCZOS)
             
             output_buffer = io.BytesIO()
+            # Guardamos siempre como PNG para preservar calidad y transparencia
             img.save(output_buffer, format="PNG", optimize=True)
-            return output_buffer, final_w, final_h
-    except:
+            return output_buffer, new_w, new_h
+    except Exception as e:
+        print(f"Error resize: {e}")
         return None, 0, 0
 
 # --- ENDPOINT PRINCIPAL ---
@@ -92,30 +107,36 @@ async def generate_excel(data: QuotationData):
     fmt_total_label = workbook.add_format({'bold': True, 'bg_color': '#4472C4', 'font_color': 'white', 'align': 'right', 'valign': 'vcenter', 'border': 1})
     fmt_total_value = workbook.add_format({'bold': True, 'num_format': '$#,##0.00', 'bg_color': '#4472C4', 'font_color': 'white', 'align': 'center', 'valign': 'vcenter', 'border': 1})
 
-    # --- 2. COLUMNAS ---
-    worksheet.set_column('A:A', 28) # Ancho para logo y fotos
+    # --- 2. COLUMNAS Y FILAS ---
+    worksheet.set_column('A:A', 28)
     worksheet.set_column('B:B', 15)
     worksheet.set_column('C:C', 45)
     worksheet.set_column('D:D', 10)
     worksheet.set_column('E:F', 15)
 
-    # --- 3. LOGO (PROCESADO Y REDIMENSIONADO) ---
+    # Dar altura a las filas de la cabecera para que el logo respire
+    for r in range(5):
+        worksheet.set_row(r, 25) # 25 puntos de alto por fila en el encabezado
+
+    # --- 3. LOGO (PROCESADO CON TRANSPARENCIA) ---
     try:
         logo_url = "https://konig-kids.com/wp-content/uploads/2023/05/konigkids-logo.png"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         
         logo_response = requests.get(logo_url, headers=headers, timeout=5)
         
         if logo_response.status_code == 200:
-            # AQUÍ ESTÁ EL CAMBIO: Redimensionamos el logo con Pillow antes de insertarlo
-            # Lo forzamos a caber en 180x90 px
-            logo_buffer, l_w, l_h = resize_image_generic(logo_response.content, MAX_LOGO_WIDTH, MAX_LOGO_HEIGHT)
+            # Procesamos el logo con la función inteligente
+            logo_buffer, l_w, l_h = smart_resize(logo_response.content, MAX_LOGO_W, MAX_LOGO_H)
             
             if logo_buffer:
+                # Calculamos centrado vertical en el espacio de 5 filas (aprox 125 puntos = 166px)
+                # Un offset simple de 10px suele bastar
                 worksheet.insert_image('A1', 'logo.png', {
                     'image_data': logo_buffer,
-                    'x_offset': 10, # Pequeño margen izquierda
-                    'y_offset': 10  # Pequeño margen superior
+                    'x_offset': 15, 
+                    'y_offset': 15,
+                    'object_position': 1
                 })
         else:
             worksheet.write('A3', "LOGO ERR", fmt_cell_center)
@@ -123,8 +144,7 @@ async def generate_excel(data: QuotationData):
         print(f"Error logo: {e}")
         worksheet.write('A3', "LOGO ERR", fmt_cell_center)
 
-    # --- 4. TEXTO DE CABECERA ---
-    # El logo estará flotando en A1, el texto va de B a F
+    # --- 4. TEXTO CABECERA ---
     worksheet.merge_range('B1:F1', "KONIG KIDS LIMITED", fmt_company)
     worksheet.merge_range('B2:F2', "Add: NO.12 Southern Dengfeng Road, Chenghai District.", fmt_info)
     worksheet.merge_range('B3:F3', "Tel: 0754-89861629 Email: sales@konig-kids.com", fmt_info)
@@ -137,12 +157,12 @@ async def generate_excel(data: QuotationData):
     for col, text in enumerate(headers):
         worksheet.write(TABLE_HEADER_ROW, col, text, fmt_table_header)
 
-    # --- 6. DESCARGA PRODUCTOS ---
+    # --- 6. DESCARGA ASÍNCRONA DE PRODUCTOS ---
     async with aiohttp.ClientSession() as session:
         tasks = [process_image(session, item.image_product) for item in data.items]
         processed_results = await asyncio.gather(*tasks)
 
-    # --- 7. LLENADO DATOS ---
+    # --- 7. LLENADO ---
     START_DATA_ROW = TABLE_HEADER_ROW + 1
     row_height_points = 120
     
@@ -153,7 +173,7 @@ async def generate_excel(data: QuotationData):
         img_buffer, img_w, img_h = processed_results[i]
         
         if img_buffer:
-            # Centrado
+            # Centrado Matemático
             x_off = (CELL_WIDTH_PX - img_w) // 2
             y_off = (CELL_HEIGHT_PX - img_h) // 2
 
