@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+xlsxwriter
+requests
+Pillow
+pydantic
+python-multipart
